@@ -121,3 +121,31 @@ static void medir(void) {
         printf("Medicion finalizada: %.1f RPM. Pulsar INICIO para otra.\n",ultima_rpm);
     }
 }
+/* PCF8574 del LCD: RS=P0, RW=P1, E=P2, luz=P3, datos=P4..P7. */
+static uint8_t lcd_addr=LCD_ADDR;
+static bool lcd_disponible;
+static void esperar_us(unsigned us) {
+    int64_t desde=esp_timer_get_time();
+    while(esp_timer_get_time()-desde<us) { }
+}
+static esp_err_t i2c_escribir(uint8_t direccion,uint8_t *datos,size_t n) {
+    i2c_cmd_handle_t cmd=i2c_cmd_link_create();
+    if(!cmd) return ESP_ERR_NO_MEM;
+    esp_err_t err=i2c_master_start(cmd);
+    if(err==ESP_OK) err=i2c_master_write_byte(cmd,(direccion<<1)|I2C_MASTER_WRITE,true);
+    if(err==ESP_OK && n) err=i2c_master_write(cmd,datos,n,true);
+    if(err==ESP_OK) err=i2c_master_stop(cmd);
+    if(err==ESP_OK) err=i2c_master_cmd_begin(I2C_NUM_0,cmd,pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return err;
+}
+static void lcd_nibble(uint8_t x) {
+    if(!lcd_disponible) return;
+    uint8_t b[]={x|8,x|12,x|8};
+    if(i2c_escribir(lcd_addr,b,sizeof b)!=ESP_OK) {
+        lcd_disponible=false;
+        printf("LCD desconectado. Revisar cableado y reiniciar.\n");
+        return;
+    }
+    esperar_us(60);
+}
