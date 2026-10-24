@@ -149,3 +149,99 @@ static void lcd_nibble(uint8_t x) {
     }
     esperar_us(60);
 }
+static void lcd_byte(uint8_t x,bool dato) {
+    lcd_nibble((x&0xf0)|(dato?1:0));
+    lcd_nibble((x<<4)|(dato?1:0));
+}
+static void lcd_init(void) {
+    /* En ESP8266 se instala I2C antes de configurarlo. */
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0,I2C_MODE_MASTER));
+    i2c_config_t c={.mode=I2C_MODE_MASTER,.sda_io_num=LCD_SDA,
+        .scl_io_num=LCD_SCL,.sda_pullup_en=GPIO_PULLUP_ENABLE,
+        .scl_pullup_en=GPIO_PULLUP_ENABLE,.clk_stretch_tick=300};
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0,&c));
+    esp_err_t err=i2c_escribir(lcd_addr,NULL,0);
+    if(err!=ESP_OK) {
+        uint8_t alternativa=lcd_addr==0x27?0x3f:0x27;
+        err=i2c_escribir(alternativa,NULL,0);
+        if(err==ESP_OK) lcd_addr=alternativa;
+    }
+    if(err!=ESP_OK) {
+        for(unsigned a=0x20;a<=0x3f;a++) {
+            if(a>0x27 && a<0x38) continue;
+            if(i2c_escribir(a,NULL,0)==ESP_OK) {lcd_addr=a;err=ESP_OK;break;}
+        }
+    }
+    if(err!=ESP_OK) {
+        printf("LCD no responde. Revisar D2/SDA, D1/SCL, convertidor y GND.\n");
+        return;
+    }
+    lcd_disponible=true;
+    printf("LCD I2C: 0x%02x\n",lcd_addr);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcd_nibble(0x30); vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_nibble(0x30); vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_nibble(0x30); lcd_nibble(0x20);
+    lcd_byte(0x28,false); lcd_byte(0x0c,false); lcd_byte(0x06,false);
+    lcd_byte(0x01,false); vTaskDelay(pdMS_TO_TICKS(3));
+}
+static void linea(unsigned fila,const char *texto) {
+    if(!lcd_disponible || fila>=2) return;
+    static const uint8_t offset[]={0,0x40};
+    lcd_byte(0x80|offset[fila],false);
+    size_t n=strlen(texto);
+    for(unsigned i=0;i<16;i++) lcd_byte(i<n?texto[i]:' ',true);
+}
+static void guardar(void) {
+    ESP_ERROR_CHECK(gpio_set_intr_type(SENSOR,GPIO_INTR_DISABLE));
+    esp_err_t err=nvs_set_blob(memoria,"factor",&factor,sizeof factor);
+    if(err==ESP_OK) err=nvs_set_u32(memoria,"ppr",ppr);
+    if(err==ESP_OK) err=nvs_set_u8(memoria,"cal",calibrada);
+    if(err==ESP_OK && respaldo) err=nvs_set_blob(memoria,"ref",&factor_ref,sizeof factor_ref);
+    if(err==ESP_OK && respaldo) err=nvs_set_u32(memoria,"refppr",ppr_ref);
+    if(err==ESP_OK) err=nvs_commit(memoria);
+    printf("Guardado: %s\n",esp_err_to_name(err));
+    if(err==ESP_OK) {
+        persist_factor=factor;persist_ppr=ppr;persist_cal=calibrada;
+        persist_ref=factor_ref;persist_refppr=ppr_ref;persist_respaldo=respaldo;
+    } else {
+        factor=persist_factor;ppr=persist_ppr;calibrada=persist_cal;
+        factor_ref=persist_ref;ppr_ref=persist_refppr;respaldo=persist_respaldo;
+        /* Conservar configuracion anterior en RAM y reabrir el namespace. */
+        nvs_close(memoria);
+        ESP_ERROR_CHECK(nvs_open("tacometro",NVS_READWRITE,&memoria));
+    }
+    reset_captura(); ESP_ERROR_CHECK(gpio_set_intr_type(SENSOR,GPIO_INTR_ANYEDGE));
+    inicio_medicion=esp_timer_get_time();
+}
+static void iniciar(void) {
+    marcha=true; calibrando=false; reset_captura();
+    ultima_rpm=0; lectura_guardada=false; medida_finalizada=false;
+    inicio_medicion=esp_timer_get_time();
+    pitidos(1);
+    printf("Medicion iniciada\n");
+}
+static void detener(void) {
+    marcha=calibrando=false;
+    pitido_fases=0;
+    reset_captura();
+    printf("Medicion detenida. Ultima lectura: %.0f RPM\n",ultima_rpm);
+}
+static void alternar_calibracion(void) {
+    if(!marcha) iniciar();
+    calibrando=!calibrando;
+    if(calibrando) pitidos(2);
+    else pitido_fases=0;
+}
+static void restaurar(void) {
+    if(!respaldo) {printf("No hay referencia guardada\n");return;}
+    factor=factor_ref;ppr=ppr_ref;calibrada=true;calibrando=false;
+    guardar();
+}
+typedef struct {int pin; int previo,firme;int64_t cambio;} boton_t;
+static bool boton(boton_t *b) {
+    int x=gpio_get_level(b->pin);int64_t t=esp_timer_get_time();
+    if(x!=b->previo){b->previo=x;b->cambio=t;}
+    if(t-b->cambio>=40000 && x!=b->firme){b->firme=x;return true;}
+    return false;
+}
