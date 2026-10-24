@@ -245,3 +245,78 @@ static bool boton(boton_t *b) {
     if(t-b->cambio>=40000 && x!=b->firme){b->firme=x;return true;}
     return false;
 }
+static void comando(const char *s) {
+    if(!strcmp(s,"INICIO")) iniciar();
+    else if(!strcmp(s,"PARAR")) detener();
+    else if(!strcmp(s,"CAL")) alternar_calibracion();
+    else if(!strcmp(s,"RESTAURAR")) restaurar();
+    else if(!strncmp(s,"PPR ",4)) {
+        char *fin;long p=strtol(s+4,&fin,10);
+        if(marcha || *fin || p<1 || p>20) printf("Detener y usar PPR 1..20\n");
+        else {ppr=p;factor=1;calibrada=false;guardar();}
+    } else if(!strncmp(s,"REF ",4)) {
+        char *fin;float ref=strtof(s+4,&fin);float f=cruda>0?ref/cruda:0;
+        if(*fin || !calibrando || !estable || !isfinite(ref) ||
+            ref<60 || ref>12000 || f<0.5f || f>2.0f) {
+            printf("REF rechazada: activar CAL, estabilizar y usar referencia real\n");
+        } else {
+            factor=f;calibrada=respaldo=true;factor_ref=f;ppr_ref=ppr;
+            calibrando=false;guardar();
+        }
+    } else printf("Comandos: INICIO PARAR CAL REF <rpm> PPR <1..20> RESTAURAR\n");
+}
+void app_main(void) {
+    esp_err_t err=nvs_flash_init();
+    if(err==ESP_ERR_NVS_NO_FREE_PAGES) {
+        ESP_ERROR_CHECK(nvs_flash_erase());err=nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    ESP_ERROR_CHECK(nvs_open("tacometro",NVS_READWRITE,&memoria));
+    size_t sz=sizeof factor;
+    nvs_get_blob(memoria,"factor",&factor,&sz);
+    uint32_t p=1;nvs_get_u32(memoria,"ppr",&p);ppr=p;
+    uint8_t c=0;nvs_get_u8(memoria,"cal",&c);calibrada=c==1;
+    if(!isfinite(factor)||factor<0.5f||factor>2||ppr<1||ppr>20) {
+        factor=1;ppr=1;calibrada=false;
+    }
+    sz=sizeof factor_ref;
+    respaldo=nvs_get_blob(memoria,"ref",&factor_ref,&sz)==ESP_OK;
+    p=1;respaldo=respaldo && nvs_get_u32(memoria,"refppr",&p)==ESP_OK;
+    ppr_ref=p;respaldo=respaldo && isfinite(factor_ref) &&
+        factor_ref>=0.5f && factor_ref<=2 && p>=1 && p<=20;
+    persist_factor=factor;persist_ppr=ppr;persist_cal=calibrada;
+    persist_ref=factor_ref;persist_refppr=ppr_ref;persist_respaldo=respaldo;
+    ESP_ERROR_CHECK(gpio_set_level(ROJO,1));
+    ESP_ERROR_CHECK(gpio_set_level(VERDE,1));
+    ESP_ERROR_CHECK(gpio_set_level(AZUL,0));
+    ESP_ERROR_CHECK(gpio_set_level(BUZZER,0));
+    gpio_config_t out={.pin_bit_mask=(1U<<ROJO)|(1U<<VERDE)|
+        (1U<<AZUL)|(1U<<BUZZER),.mode=GPIO_MODE_OUTPUT,
+        .pull_up_en=GPIO_PULLUP_DISABLE,.pull_down_en=GPIO_PULLDOWN_DISABLE,
+        .intr_type=GPIO_INTR_DISABLE};
+    ESP_ERROR_CHECK(gpio_config(&out));
+    uint32_t duty[]={0};
+    const uint32_t pwm_gpio[]={BUZZER};
+    ESP_ERROR_CHECK(pwm_init(500,duty,1,pwm_gpio)); /* 2 kHz */
+    ESP_ERROR_CHECK(pwm_set_phase(0,0));
+    ESP_ERROR_CHECK(pwm_start());
+    gpio_config_t in={.pin_bit_mask=(1U<<SENSOR)|(1U<<INICIO)|(1U<<CAL),.mode=GPIO_MODE_INPUT,.pull_up_en=GPIO_PULLUP_ENABLE};
+    ESP_ERROR_CHECK(gpio_config(&in));
+    ESP_ERROR_CHECK(gpio_set_intr_type(SENSOR,GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(SENSOR,pulso,NULL));
+    sensor_nivel=gpio_get_level(SENSOR);
+    sensor_cambio=esp_timer_get_time();
+    uart_config_t uart={.baud_rate=115200,.data_bits=UART_DATA_8_BITS,
+        .parity=UART_PARITY_DISABLE,.stop_bits=UART_STOP_BITS_1,
+        .flow_ctrl=UART_HW_FLOWCTRL_DISABLE};
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0,&uart));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0,512,0,0,NULL,0));
+    lcd_init();
+    printf("Tacometro ESP8266 v5 LCD1602 retencion estable filtro 2ms listo. Usar referencia real para calibrar.\n");
+    printf("INICIO, PARAR, CAL, REF <rpm>, PPR <1..20>, RESTAURAR\n");
+    boton_t bi={INICIO,1,1,0},bc={CAL,1,1,0};
+    int64_t cal_desde=0,proxima_pantalla=0,alarma_desde=0;
+    bool larga=false,alarma_previa=false;
+    bool sonido_anterior=false;
+    char entrada[80];unsigned len=0;
