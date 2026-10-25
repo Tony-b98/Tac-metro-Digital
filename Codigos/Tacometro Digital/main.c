@@ -320,3 +320,69 @@ void app_main(void) {
     bool larga=false,alarma_previa=false;
     bool sonido_anterior=false;
     char entrada[80];unsigned len=0;
+  for(;;) {
+        int64_t ahora=esp_timer_get_time();
+        if(boton(&bi) && bi.firme==0) {
+            if(marcha) detener();
+            else iniciar();
+        }
+        if(boton(&bc)) {
+            if(bc.firme==0){cal_desde=ahora;larga=false;}
+            else if(!larga) alternar_calibracion();
+        }
+        if(bc.firme==0 && !larga && ahora-cal_desde>=3000000) {
+            larga=true;restaurar();
+        }
+        uint8_t ch;
+        while(uart_read_bytes(UART_NUM_0,&ch,1,0)>0) {
+            if(ch=='\n'||ch=='\r') {
+                if(len){entrada[len]=0;comando(entrada);len=0;}
+            } else if(len<sizeof entrada-1) entrada[len++]=ch;
+        }
+        medir();
+        bool error=marcha && ahora-inicio_medicion>3000000 && (!senal||!rango||irregular);
+        /* Una sola indicacion: error, calibracion o estado guardado. */
+        bool alarma=marcha && (error || (!calibrada && !calibrando &&
+                     ahora-inicio_medicion>=3000000));
+        gpio_set_level(ROJO,!alarma);
+        gpio_set_level(VERDE,!((marcha || medida_finalizada) && calibrada && !calibrando && !error));
+        gpio_set_level(AZUL,marcha && calibrando && !error);
+        if(alarma && !alarma_previa) {
+            alarma_desde=ahora;
+            pitido_fases=0;
+        }
+        alarma_previa=alarma;
+        while(pitido_fases && ahora>=pitido_hasta) {
+            pitido_fases--;
+            pitido_hasta+=200000;
+        }
+        /* Dos pitidos: 200 ms sonido, 200 ms pausa, 200 ms sonido.
+           LED rojo: 200 ms sonido / 300 ms pausa mientras siga encendido. */
+        bool sonido=marcha && (alarma ? (ahora-alarma_desde)%500000<200000 :
+                            pitido_fases%2!=0);
+        if(sonido!=sonido_anterior) {
+            ESP_ERROR_CHECK(pwm_set_duty(0,sonido?250:0));
+            ESP_ERROR_CHECK(pwm_start());
+            sonido_anterior=sonido;
+        }
+        if(ahora>=proxima_pantalla) {
+            /* LCD 1602: RPM en fila 1; estado en fila 2.
+               El resultado final no cambia aunque el eje se detenga. */
+            char b[40];
+            if(!marcha && lectura_guardada) snprintf(b,sizeof b,"RPM: %.0f",ultima_rpm);
+            else if(senal && rango && !irregular) snprintf(b,sizeof b,"RPM: %.0f",rpm);
+            else snprintf(b,sizeof b,"RPM: --");
+            linea(0,b);
+            const char *estado=medida_finalizada?"ESTABLE - INICIO":
+                !marcha?"DETENIDO":calibrando?"CALIBRACION":!senal?
+                "SIN SENAL":!rango?"FUERA DE RANGO":irregular?
+                "SENAL IRREGULAR":estable?"LECTURA ESTABLE":"ESTABILIZANDO";
+            /* Avisar si la lectura retenida aun no tiene calibracion. */
+            if(medida_finalizada && !calibrada) estado="SIN CALIBRAR";
+            linea(1,estado);
+            proxima_pantalla=ahora+250000;
+            printf("RPM=%.1f senal=%d estable=%d rango=%d pulsos=%u descartados=%u irregular=%d\n",rpm,senal,estable,rango,pulsos_ventana,descartados_ventana,irregular);
+        }
+        vTaskDelay(1);
+    }
+}
