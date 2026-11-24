@@ -1,49 +1,86 @@
+
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
 #include <limits.h>
+#include "esp_attr.h"
 
 #define CAPTURA_TIMEOUT_US 3000000LL
 #define CAPTURA_VENTANA_US 1000000LL
+#define CAPTURA_TOLERANCIA 0.10
+#define CAPTURA_MINIMO_US 2500U
+#define CAPTURA_MINIMO_PISO_US 100U
 
 typedef struct {
     int64_t ultimo;
     uint64_t suma_us;
-    uint32_t periodos, descartados, minimo_us, maximo_us;
+    uint32_t periodos, descartados;
+    uint32_t minimo_us, maximo_us;
+    uint32_t periodo_us;
+    uint32_t vuelta_us, vuelta_marcas;
+    uint64_t vueltas_suma_us;
+    uint32_t vueltas;
 } captura_t;
 
-static inline void captura_limpiar(volatile captura_t *c) {
+typedef struct {float cruda,rpm; bool rango,regular;} resultado_t;
+
+static inline IRAM_ATTR void captura_limpiar(volatile captura_t *c) {
     c->suma_us=0; c->periodos=0; c->descartados=0;
     c->minimo_us=UINT32_MAX; c->maximo_us=0;
+    c->vueltas_suma_us=0; c->vueltas=0;
 }
+
 static inline void captura_reset(volatile captura_t *c) {
-    c->ultimo=0; captura_limpiar(c);
+    c->ultimo=0; c->periodo_us=0;
+    c->vuelta_us=0; c->vuelta_marcas=0;
+    captura_limpiar(c);
 }
-static inline void captura_evento(volatile captura_t *c,int64_t ahora,unsigned ppr) {
+
+static inline IRAM_ATTR void captura_evento(volatile captura_t *c,int64_t ahora,unsigned ppr) {
+    if(!ppr) return;
     if(!c->ultimo) {c->ultimo=ahora; return;}
     int64_t dt=ahora-c->ultimo;
     if(dt<=0) {c->descartados++; return;}
-    /* 24000 RPM crudas: admite factor de calibracion hasta 0.5.
-       No mover ultimo al rechazar un rebote corto. */
-    unsigned minimo=2500U/ppr;
-    if(minimo<200) minimo=200;
+    unsigned minimo=CAPTURA_MINIMO_US/ppr;
+    if(minimo<CAPTURA_MINIMO_PISO_US) minimo=CAPTURA_MINIMO_PISO_US;
     if(dt<(int64_t)minimo) {c->descartados++; return;}
     c->ultimo=ahora;
-    if(dt>=CAPTURA_TIMEOUT_US) {captura_limpiar(c); return;}
-    c->periodos++; c->suma_us+=(uint32_t)dt;
-    if((uint32_t)dt<c->minimo_us) c->minimo_us=(uint32_t)dt;
-    if((uint32_t)dt>c->maximo_us) c->maximo_us=(uint32_t)dt;
+    if(dt>=CAPTURA_TIMEOUT_US) {
+        c->periodo_us=0; c->vuelta_us=0; c->vuelta_marcas=0;
+        captura_limpiar(c);
+        return;
+    }
+    uint32_t p=(uint32_t)dt;
+    c->periodo_us=p;
+    c->periodos++; c->suma_us+=p;
+    c->vuelta_us+=p; c->vuelta_marcas++;
+    if(c->vuelta_marcas>=ppr) {
+        uint32_t v=c->vuelta_us;
+        c->vueltas++; c->vueltas_suma_us+=v;
+        if(v<c->minimo_us) c->minimo_us=v;
+        if(v>c->maximo_us) c->maximo_us=v;
+        c->vuelta_us=0; c->vuelta_marcas=0;
+    }
 }
-typedef struct {float cruda,rpm; bool rango,regular;} resultado_t;
+
 static inline resultado_t captura_resultado(const captura_t *c,unsigned ppr,float factor) {
     resultado_t r={0};
     if(!c->periodos || !c->suma_us || !ppr) return r;
-    r.cruda=(float)(60000000.0*(double)c->periodos/((double)c->suma_us*ppr));
+    if(c->vueltas && c->vueltas_suma_us)
+        r.cruda=(float)(60000000.0*(double)c->vueltas/(double)c->vueltas_suma_us);
+    else
+        r.cruda=(float)(60000000.0*(double)c->periodos/((double)c->suma_us*ppr));
     r.rpm=r.cruda*factor;
     r.rango=r.rpm>=60.0f && r.rpm<=12000.0f;
-    double promedio=(double)c->suma_us/c->periodos;
-    /* No declarar estable una entrada con muchos pulsos descartados. */
-    r.regular=(c->maximo_us-c->minimo_us)<=promedio*0.10 &&
-              (uint64_t)c->descartados*4<=c->periodos;
+    bool pocos_descartes=(uint64_t)c->descartados*4<=c->periodos;
+    if(c->vueltas) {
+        double promedio=(double)c->vueltas_suma_us/c->vueltas;
+        r.regular=pocos_descartes &&
+                  (double)(c->maximo_us-c->minimo_us)<=promedio*CAPTURA_TOLERANCIA;
+    } else {
+        r.regular=pocos_descartes;
+    }
     return r;
 }
+
+
